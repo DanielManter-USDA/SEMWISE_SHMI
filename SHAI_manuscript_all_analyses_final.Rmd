@@ -1,0 +1,1572 @@
+---
+title: "Structural Equation Modeling for the SHAI project"
+author: "Heather Deel"
+date: "2022-5-29"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=TRUE}
+knitr::opts_knit$set(root.dir = "C:/Users/Heather.Deel/USDA/Manter, Daniel - REE-ARS - NRCS.SHAI/Heather")
+```
+
+### Libraries
+```{r, warning=FALSE}
+library(lavaan)
+library(lavaanPlot)
+library(parameters)
+library(skimr)
+library(MASS)
+library(semPlot)
+library(ggplot2)
+library(readxl)
+library(tidyverse)
+library(lme4)
+library(qdapTools)
+library(ggpubr)
+library(caret)
+library(kgc)
+library(aomisc)
+library(patchwork)
+library(ldsr)
+library(usmap)
+library(sp)
+library(rstatix)
+library(car)
+library(ggiraphExtra)
+```
+
+### Load in Data
+```{r}
+data <- read_excel('C:/Users/Heather.Deel/USDA/Manter, Daniel - REE-ARS - NRCS.SHAI/Heather/SHAI.Meta.22March2023.xlsm', sheet='Final', range='A2:CX694')
+dim(data)
+# 692 samples
+
+# get climate zones (section has already been run and added to meta file, so if (FALSE) is used to comment it out)
+if (FALSE) {
+coords <- data.frame(ID = data$PLFA_ID,
+                     rndCoord.lat = RoundCoordinates(data$Latitude),
+                     rndCoord.lon = RoundCoordinates(data$Longitude))
+data$ClimateZ <- LookupCZ(coords, res = "fine", rc = TRUE)
+}
+
+# remove samples without CASH data
+data <- data %>%
+  filter(Remove.SH == "No")
+dim(data)
+# 632 samples with CASH data that can be used for SH index (Yr 2 - Alaska missing DNA data)
+
+# count by land use
+data %>%
+  count('Current_Land_Use')
+
+# count samples by State
+data %>%
+  count('State')
+# 25 states
+
+# count samples by ClimateZ
+data %>%
+  count('ClimateZ')
+# BSk	91			
+# Cfa	147			
+# Csa	106			
+# Csb	89			
+# Dfa	36			
+# Dfb	75			
+# Dfc	48			
+# Dsb	8	
+
+# remove Dsb climate zone
+data <- data[data$ClimateZ != "Dsb",]
+dim(data)
+# 592 samples
+
+# get 'acidity' by reverse scoring ph
+# highest ph is 8,358, add one and subtract ph
+data <- data %>% 
+  mutate(acidity = - ph)
+
+# explore data
+#skim(data)
+
+# find box-cox lambda's 
+bc <- boxcox(agg_stab~1, data=data)
+lam.agg_stab <- bc$x[which.max(bc$y)]
+bc <- boxcox(SOM~1, data=data)
+lam.SOM <- bc$x[which.max(bc$y)]
+bc <- boxcox(ace~1, data=data)
+lam.ace <- bc$x[which.max(bc$y)]
+bc <- boxcox(resp~1, data=data)
+lam.resp <- bc$x[which.max(bc$y)]
+
+# apply boxcox or log transformations 
+# previous iterations compared log10 or box-cox transformations 
+data.tran <- data %>%
+  mutate(water_cap = log10(water_cap)) %>%
+  mutate(agg_stab = (agg_stab^lam.agg_stab-1)/lam.agg_stab) %>%
+  mutate(SOM = (SOM^lam.SOM-1)/lam.SOM) %>%
+  mutate(activeC = log10(activeC)) %>%
+  mutate(ace = (ace^lam.ace-1)/lam.ace) %>%
+  mutate(resp = (resp^lam.resp-1)/lam.resp) %>%
+  mutate(qPCR = log10(qPCR))
+
+# check for normality
+apply(data[,c('water_cap', 'agg_stab', 'SOM', 'activeC', 'ace', 'resp', 'qPCR', 'acidity')], 2, shapiro.test) 
+apply(data.tran[,c('water_cap', 'agg_stab', 'SOM', 'activeC', 'ace', 'resp', 'qPCR', 'acidity')], 2, shapiro.test) 
+# all tests p < 0.05
+
+# explore data
+#skim(data.tran)
+
+# find outliers
+outLiars <- psych::outlier(data.tran[,c('water_cap', 'agg_stab', 'SOM', 'activeC', 'ace', 'resp','qPCR', 'acidity')], plot=TRUE)
+alph_crit <- .001
+n_nu      <- 8
+crit_val  <- (qchisq(p = 1-(alph_crit), df = n_nu))
+outers <- data.frame(outLiars) %>% 
+  mutate(PID = data.tran$PLFA_ID) %>% 
+  filter(outLiars > crit_val) %>% 
+  arrange(desc(outLiars)) 
+outers
+
+# remove four outliers
+data.tran <- data.tran[!(data.tran$PLFA_ID %in% outers$PID),]
+dim(data.tran)
+
+# explore boxcox transformed data
+#skim(data.tran)
+
+# recount the states
+data.tran %>%
+  count('State')
+
+data.tran %>%
+  count('Site')
+
+## data looks good proceed to SEM...
+```
+
+### SEM to calculate soil health score
+```{r}
+# create binaries for climate data, center and scale soil health indicators
+data.scale <- data.tran %>%
+  mutate(BSk = ifelse(ClimateZ == 'BSk', 1, 0)) %>%
+  mutate(Cfa = ifelse(ClimateZ == 'Cfa', 1, 0)) %>%
+  mutate(Csa = ifelse(ClimateZ == 'Csa', 1, 0)) %>%
+  mutate(Csb = ifelse(ClimateZ == 'Csb', 1, 0)) %>%
+  mutate(Dfa = ifelse(ClimateZ == 'Dfa', 1, 0)) %>%
+  mutate(Dfb = ifelse(ClimateZ == 'Dfb', 1, 0)) %>%
+  mutate(Dfc = ifelse(ClimateZ == 'Dfc', 1, 0)) %>%
+  mutate(clay = (scale(clay))) %>%
+  mutate(ph = (scale(ph))) %>%
+  mutate(water_cap = (scale(water_cap))) %>%
+  mutate(agg_stab = (scale(agg_stab))) %>%
+  mutate(SOM = (scale(SOM))) %>%
+  mutate(ace = (scale(ace))) %>%
+  mutate(resp = (scale(resp))) %>%
+  mutate(activeC = (scale(activeC))) %>%
+  mutate(PLFA = (scale(PLFA))) %>%
+  mutate(qPCR= (scale(qPCR))) %>% 
+  mutate(acidity = (scale(acidity)))
+
+data.scale %>% 
+  count('Site')
+
+# test for latent variables
+cash <- data.scale[,c('SOM', 'activeC', 'resp', 'qPCR', 'agg_stab', 'ace', 'water_cap', 'acidity')]
+performance::check_factorstructure(cash)
+# moderate evidence that the data are appropriate for factor analysis (KMO=0.65)
+
+# check for multiple factors
+psych::scree(cash, pc=FALSE)
+psych::fa.parallel(cash, fa="fa")
+fit <- factanal(cash, 1, rotation="promax")
+print(fit, digits=2, cutoff=0.3, sort=TRUE)
+
+# First attempt at single latent variable
+m1 = '
+  # latent variables
+    SH =~ SOM + activeC + resp + qPCR + agg_stab + ace + water_cap + acidity
+    SOM + activeC + resp + qPCR + agg_stab + ace + water_cap + acidity ~ Cfa + Csa + Csb + Dfa + Dfb + Dfc + clay + Cfa:clay + Csa:clay + Csb:clay + Dfa:clay + Dfb:clay + Dfc:clay
+'
+fit1 <- sem(m1, data=data.scale, estimator='MLR', meanstructure=T) 
+summary(fit1, rsquare=T, standardized=T, fit.measures=T, estimates=T) 
+# all indicators are significant except (acidity)
+# Robust CFI = 0.918, Robust RMSEA = 0.199, SRMR = 0.017
+
+# rerun model without acidity
+m1 = '
+  # latent variables
+    SH =~ SOM + activeC + resp + qPCR + agg_stab + ace + water_cap
+    SOM + activeC + resp + qPCR + agg_stab + ace + water_cap ~ Cfa + Csa + Csb + Dfa + Dfb + Dfc + clay + Cfa:clay + Csa:clay + Csb:clay + Dfa:clay + Dfb:clay + Dfc:clay
+'
+fit1 <- sem(m1, data=data.scale, estimator='MLR', meanstructure=T) 
+summary(fit1, rsquare=T, standardized=T, fit.measures=T, estimates=T) 
+# CFI = 0.966, RMSEA = 0.148, SRMR = 0.011
+
+# look for potential modifications
+modificationindices(fit1, sort=TRUE) 
+
+# rerun adding covariances with modification indices > 10
+m2 = '
+  # latent variables
+    SH =~ SOM + activeC + resp + qPCR + agg_stab + ace + water_cap
+    SOM + activeC + resp + qPCR + agg_stab + ace + water_cap ~ Cfa + Csa + Csb + Dfa + Dfb + Dfc + clay + Cfa:clay + Csa:clay + Csb:clay + Dfa:clay + Dfb:clay + Dfc:clay
+    
+  # covariances
+    agg_stab ~~ water_cap
+    activeC ~~ agg_stab
+    agg_stab ~~ ace
+    ace ~~ water_cap
+    qPCR ~~ water_cap
+    resp ~~ qPCR
+'
+fit2 <- sem(m2, data=data.scale, estimator='MLR', meanstructure=T) 
+summary(fit2, rsquare=T, standardized=T, fit.measures=T, estimates=T) 
+# very good fit, Robust CFI = 0.999, RMSEA = 0.040, SRMR = 0.003
+
+# check for Inter Class Correlations
+mod <- lmerTest::lmer(water_cap ~ 1 + (1|Cluster), data=data.scale)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(SOM ~ 1 + (1|Cluster), data=data.scale)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(agg_stab~ 1 + (1|Cluster), data=data.scale)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(activeC ~ 1 + (1|Cluster), data=data.scale)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(ace ~ 1 + (1|Cluster), data=data.scale)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(resp ~ 1 + (1|Cluster), data=data.scale)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(qPCR ~ 1 + (1|Cluster), data=data.scale)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+# adding clusters to the above model
+m3 = '
+  # latent variables
+    SH =~ SOM + activeC + resp + qPCR + agg_stab + ace + water_cap 
+    SOM + activeC + resp + qPCR + agg_stab + ace + water_cap ~ Cfa + Csa + Csb + Dfa + Dfb + Dfc + clay + Cfa:clay + Csa:clay + Csb:clay + Dfa:clay + Dfb:clay + Dfc:clay
+
+  # covariances
+    agg_stab ~~ water_cap
+    activeC ~~ agg_stab
+    agg_stab ~~ ace
+    ace ~~ water_cap
+    qPCR ~~ water_cap
+    resp ~~ qPCR
+'
+fit3 <- sem(m3, data=data.scale, estimator='MLR', meanstructure=T, cluster='Cluster') 
+summary(fit3, rsquare=T, standardized=T, fit.measures=T, estimates=T) 
+# excellent fit, CFI = 0.999, RMSEA = 0.028, SRMR = 0.003
+
+# get final SH latent variable
+data.pred <- data.scale
+data.pred$SH <- lavPredict(fit3, newdata=data.pred, type='lv')
+
+# get cumulative distribution function
+eq <- ecdf(data.pred$SH)
+data.pred$SH_rating <- eq(data.pred$SH)*100
+
+data.pred <- data.pred %>%
+  mutate(SH_bin = case_when(SH_rating <= 20 ~ 1,
+                            SH_rating > 20 & SH_rating <= 40 ~ 2,
+                            SH_rating > 40 & SH_rating <= 60 ~ 3,
+                            SH_rating > 60 & SH_rating <= 80 ~ 4,
+                            SH_rating > 80 ~ 5,
+                            )) %>%
+  mutate(SH_bin = factor(SH_bin))
+
+levels(data.pred$SH_bin) = c('very low', 'low', 'medium', 'high', 'very high')
+```
+
+### Make corrections to all indicators and back transform
+```{r}
+# data.pred = scaled data with predicted lv
+# test = back-transformed data.pred (i.e., corrected values)
+test <- data.pred %>%
+  mutate(SOM.pred = lavPredictY(fit3, newdata=data.pred, ynames=c('SOM'), xnames=lavNames(fit3, 'ov.x'))) %>%
+  mutate(SOM.corr = SOM - SOM.pred) %>%
+  mutate(SOM.resid = SOM - SOM.pred) %>% 
+  mutate(SOM.corr = (SOM.corr * attributes(data.pred$SOM)['scaled:scale'][[1]]) + attributes(data.pred$SOM)['scaled:center'][[1]]) %>%
+  mutate(SOM.corr = ldsr::inv_boxcox(SOM.corr, lam.SOM)) %>%
+  mutate(activeC.pred = lavPredictY(fit3, newdata=data.pred, ynames=c('activeC'), xnames=lavNames(fit3, 'ov.x'))) %>%
+  mutate(activeC.corr = activeC - activeC.pred) %>%
+  mutate(activeC.resid = activeC - activeC.pred) %>% 
+  mutate(activeC.corr = (activeC.corr * attributes(data.pred$activeC)['scaled:scale'][[1]]) + attributes(data.pred$activeC)['scaled:center'][[1]]) %>%
+  mutate(activeC.corr = 10^activeC.corr) %>% 
+  mutate(resp.pred = lavPredictY(fit3, newdata=data.pred, ynames=c('resp'), xnames=lavNames(fit3, 'ov.x'))) %>%
+  mutate(resp.corr = resp - resp.pred) %>%
+  mutate(resp.resid = resp - resp.pred) %>% 
+  mutate(resp.corr = (resp.corr * attributes(data.pred$resp)['scaled:scale'][[1]]) + attributes(data.pred$resp)['scaled:center'][[1]]) %>%
+  mutate(resp.corr = ldsr::inv_boxcox(resp.corr, lam.resp)) %>% 
+  mutate(qPCR.pred = lavPredictY(fit3, newdata=data.pred, ynames=c('qPCR'), xnames=lavNames(fit3, 'ov.x'))) %>%
+  mutate(qPCR.corr = qPCR - qPCR.pred) %>%
+  mutate(qPCR.resid = qPCR - qPCR.pred) %>% 
+  mutate(qPCR.corr = (qPCR.corr * attributes(data.pred$qPCR)['scaled:scale'][[1]]) + attributes(data.pred$qPCR)['scaled:center'][[1]]) %>%
+  mutate(qPCR.corr = 10^qPCR.corr) %>% 
+  mutate(agg_stab.pred = lavPredictY(fit3, newdata=data.pred, ynames=c('agg_stab'), xnames=lavNames(fit3, 'ov.x'))) %>%
+  mutate(agg_stab.corr = agg_stab - agg_stab.pred) %>%
+  mutate(agg_stab.resid = agg_stab - agg_stab.pred) %>% 
+  mutate(agg_stab.corr = (agg_stab.corr * attributes(data.pred$agg_stab)['scaled:scale'][[1]]) + attributes(data.pred$agg_stab)['scaled:center'][[1]]) %>%
+  mutate(agg_stab.corr = ldsr::inv_boxcox(agg_stab.corr, lam.agg_stab)) %>%
+  mutate(ace.pred = lavPredictY(fit3, newdata=data.pred, ynames=c('ace'), xnames=lavNames(fit3, 'ov.x'))) %>%
+  mutate(ace.corr = ace - ace.pred) %>%
+  mutate(ace.resid = ace - ace.pred) %>% 
+  mutate(ace.corr = (ace.corr * attributes(data.pred$ace)['scaled:scale'][[1]]) + attributes(data.pred$ace)['scaled:center'][[1]]) %>%
+  mutate(ace.corr = ldsr::inv_boxcox(ace.corr, lam.ace)) %>% 
+  mutate(water_cap.pred = lavPredictY(fit3, newdata=data.pred, ynames=c('water_cap'), xnames=lavNames(fit3, 'ov.x'))) %>%
+  mutate(water_cap.corr = water_cap - water_cap.pred) %>%
+  mutate(water_cap.resid = water_cap - water_cap.pred) %>% 
+  mutate(water_cap.corr = (water_cap.corr * attributes(data.pred$water_cap)['scaled:scale'][[1]]) + attributes(data.pred$water_cap)['scaled:center'][[1]]) %>%
+  mutate(water_cap.corr = 10^water_cap.corr) %>% 
+  mutate(clay.bt = (clay * attributes(data.pred$clay)['scaled:scale'][[1]]) + attributes(data.pred$clay)['scaled:center'][[1]]) %>%
+  mutate(SOM.bt = (SOM * attributes(data.pred$SOM)['scaled:scale'][[1]]) + attributes(data.pred$SOM)['scaled:center'][[1]]) %>%
+  mutate(SOM.bt = ldsr::inv_boxcox(SOM.bt, lam.SOM)) %>%
+  mutate(activeC.bt = (activeC * attributes(data.pred$activeC)['scaled:scale'][[1]]) + attributes(data.pred$activeC)['scaled:center'][[1]]) %>%
+  mutate(activeC.bt = 10^activeC.bt) %>%
+  mutate(resp.bt = (resp * attributes(data.pred$resp)['scaled:scale'][[1]]) + attributes(data.pred$resp)['scaled:center'][[1]]) %>%
+  mutate(resp.bt = ldsr::inv_boxcox(resp.bt, lam.resp)) %>%
+  mutate(qPCR.bt = (qPCR * attributes(data.pred$qPCR)['scaled:scale'][[1]]) + attributes(data.pred$qPCR)['scaled:center'][[1]]) %>%
+  mutate(qPCR.bt = 10^qPCR.bt) %>%
+  mutate(agg_stab.bt = (agg_stab * attributes(data.pred$agg_stab)['scaled:scale'][[1]]) + attributes(data.pred$agg_stab)['scaled:center'][[1]]) %>%
+  mutate(agg_stab.bt = ldsr::inv_boxcox(agg_stab.bt, lam.agg_stab)) %>%
+  mutate(ace.bt = (ace * attributes(data.pred$ace)['scaled:scale'][[1]]) + attributes(data.pred$ace)['scaled:center'][[1]]) %>%
+  mutate(ace.bt = ldsr::inv_boxcox(ace.bt, lam.ace)) %>%
+  mutate(water_cap.bt = (water_cap * attributes(data.pred$water_cap)['scaled:scale'][[1]]) + attributes(data.pred$water_cap)['scaled:center'][[1]]) %>%
+  mutate(water_cap.bt = 10^water_cap.bt)
+
+```
+
+### Figure 1 - compare unadjusted and adjusted SOM with clay content
+```{r}
+p1 <- ggplot(data, aes(x=clay, y=SOM, fill=ClimateZ)) +
+  geom_point(shape=21, size=3) +
+  geom_smooth(aes(color=ClimateZ), method='lm', formula='y~x', guide='none', se=F) +
+  scale_fill_brewer(palette="Set1") +
+  scale_color_brewer(palette="Set1") +
+  labs(y='SOM (%)', x='Clay (%)') +
+  theme_bw()
+
+p2 <- ggplot(test, aes(x=clay.bt, y=SOM.corr, fill=ClimateZ)) +
+  geom_point(shape=21, size=3) +
+  geom_smooth(aes(color=ClimateZ), method='lm', formula='y~x', guide='none', se=F) +
+  scale_fill_brewer(palette="Set1") +
+  scale_color_brewer(palette="Set1") +
+  labs(y='Adjusted SOM (%)', x='Clay (%)') +
+  ylim(c(0,8.5)) +
+  theme_bw()
+
+p <- ggarrange(p1, p2, ncol = 2, nrow = 1, 
+               common.legend = TRUE, legend = 'right',
+               labels = c("A","B"))
+p
+#ggsave("Figure1.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+# regressions with and without correction
+mod <- lm(SOM ~ clay + ClimateZ + clay:ClimateZ, data=data)
+anova(mod)
+mod <- lm(SOM.corr ~ clay.bt + ClimateZ + clay.bt:ClimateZ, data=test)
+anova(mod)
+
+mod <- lm(activeC ~ clay + ClimateZ + clay:ClimateZ, data=data)
+anova(mod)
+mod <- lm(activeC.corr ~ clay.bt + ClimateZ + clay.bt:ClimateZ, data=test)
+anova(mod)
+
+mod <- lm(resp ~ clay + ClimateZ + clay:ClimateZ, data=data)
+anova(mod)
+mod <- lm(resp.corr ~ clay.bt + ClimateZ + clay.bt:ClimateZ, data=test)
+anova(mod)
+
+mod <- lm(qPCR ~ clay + ClimateZ + clay:ClimateZ, data=data)
+anova(mod)
+mod <- lm(qPCR.corr ~ clay.bt + ClimateZ + clay.bt:ClimateZ, data=test)
+anova(mod)
+
+mod <- lm(agg_stab ~ clay + ClimateZ + clay:ClimateZ, data=data)
+anova(mod)
+mod <- lm(agg_stab.corr ~ clay.bt + ClimateZ + clay.bt:ClimateZ, data=test)
+anova(mod)
+
+mod <- lm(ace ~ clay + ClimateZ + clay:ClimateZ, data=data)
+anova(mod)
+mod <- lm(ace.corr ~ clay.bt + ClimateZ + clay.bt:ClimateZ, data=test)
+anova(mod)
+
+mod <- lm(water_cap ~ clay + ClimateZ + clay:ClimateZ, data=data)
+anova(mod)
+mod <- lm(water_cap.corr ~ clay.bt + ClimateZ + clay.bt:ClimateZ, data=test)
+anova(mod)
+
+```
+
+### Figure 3 - compare unadjusted and adjusted SOM by cover type
+```{r}
+## unadjusted vs adjusted scores
+# cover type
+# uncorrected
+gDF <- data[data$Cover_Type %in% c('None', 'cover crop', 'perennial'),]
+gDF$Cover_Type <- factor(gDF$Cover_Type, levels = c('None', 'cover crop', 'perennial'))
+
+stat.test <- compare_means(SOM ~ Cover_Type,
+                           data = gDF,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$Group <- gsub("covercrop", "cover crop", groups$Group)
+groups$y <- 9
+#groups$Group <- c("None", "cover crop", "perennial")
+#groups$Letter <- c('a', 'a', 'a') # recode manually
+
+p1 <- ggplot(gDF, aes(x=factor(Cover_Type), y=SOM)) + 
+  scale_fill_brewer(palette="Dark2") +
+  geom_boxplot(fill='grey') + 
+  geom_jitter(aes(fill=factor(Current_Land_Use)), shape=21, size=3, width=0.2, height=0, alpha=0.5) +  
+  labs(y='SOM', x='', fill='Land Use') + 
+  theme_bw() + theme(legend.position = "none", axis.text.x=element_text(angle=45, hjust=1)) +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0, 10)
+p1
+
+#corrected
+gDF <- test[test$Cover_Type %in% c('None', 'cover crop', 'perennial'),]
+gDF$Cover_Type <- factor(gDF$Cover_Type, levels = c('None', 'cover crop', 'perennial'))
+
+stat.test <- compare_means(SOM.corr ~ Cover_Type,
+                           data = gDF,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 7
+groups$Group <- c("None", "cover crop", "perennial")
+
+p2 <- ggplot(gDF, aes(x=factor(Cover_Type), y=SOM.corr)) + 
+  scale_fill_brewer(palette="Dark2", labels = c("Annual Cropland", "Perennial Cropland", "Rangeland")) +
+  geom_boxplot(fill='grey') + 
+  geom_jitter(aes(fill=factor(Current_Land_Use)), shape=21, size=3, width=0.2, height=0, alpha=0.5) +  
+  labs(y='SOM, adjusted', x='', fill='Land Use') + 
+  theme_bw() + theme(legend.position = "none", axis.text.x=element_text(angle=45, hjust=1)) +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0, 10) +
+  scale_x_discrete(labels = c("cover crop" = "Cover Crop", "perennial" = "Perennial"))
+p2
+
+p_SOM_adj <- ggarrange(p1, p2, nrow = 1, ncol = 2, common.legend = TRUE,
+               labels = c("A","B"))
+p_SOM_adj
+
+#ggsave("Figure3.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+```
+
+### Figure 4 - compare CASH and SEMWISE ratings by climate zones
+```{r}
+# "Overall" rating is the average of CASH provided ratings of indicators
+# "SH_rating" is the Soil Health rating from SEMWISE
+# Figure 3C
+p1 <- ggplot(data.pred, aes(x=Overall, y=SH_rating, fill=ClimateZ)) + 
+  scale_fill_brewer(palette="Set1") +
+  geom_point(size=3, shape=21) + labs(x='CASH Rating', y='SEMWISE Rating') +
+  guides(fill = guide_legend(title = "Climate Zones")) +
+  theme_bw()
+
+# Figure 3B
+stat.test <- compare_means(SH_rating ~ ClimateZ,
+                           data = data.pred,
+                           method = "wilcox.test",
+                           p.adj = "fdr")
+
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 103
+
+p2 <- ggplot(data.pred, aes(x=ClimateZ, y=SH_rating)) + 
+  scale_fill_brewer(palette="Set1") +
+  geom_boxplot(aes(fill = ClimateZ)) + labs(y='SEMWISE Rating') +
+  guides(fill = guide_legend(title = "Climate Zones")) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0, 105)
+
+# Figure 3A
+# test for main effect of climate zone
+stat.test <- compare_means(Overall ~ ClimateZ,
+                           data = data.pred,
+                           method = "wilcox.test",
+                           p.adj = "fdr")
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 103
+groups$Letter <- c('c', 'cd', 'd', 'b', 'b', 'a', 'a') # recode manually
+
+p3 <- ggplot(data.pred, aes(x=ClimateZ, y=Overall)) + 
+  scale_fill_brewer(palette="Set1") +
+  geom_boxplot(aes(fill = ClimateZ)) + labs(y='CASH Rating') +
+  guides(fill = guide_legend(title = "Climate Zones")) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0, 105)
+
+plots <- data.frame(lon=data.pred$Longitude, lat=data.pred$Latitude, ClimateZ=data.pred$ClimateZ)
+plots <- usmap_transform(plots)
+
+p4 <- plot_usmap(regions='states') +
+  geom_point(data=plots, aes(x, y, fill=ClimateZ), size=2, shape=21) +
+  scale_fill_brewer(palette="Set1") +
+  guides(fill = guide_legend(title = "Climate Zones"))
+
+p <- ggarrange(p3, p2, p1, p4, ncol = 2, nrow = 2, common.legend = TRUE,
+               labels = c("A","B","C","D"))
+p
+
+#ggsave("Figure4.tiff", unit = "in", width = 8, height = 8, dpi = 300, device = "tiff")
+```
+
+### Figure 5 - CASH and SEMWISE ratings by cover type
+```{r}
+gDF <- test[test$Cover_Type %in% c('None', 'cover crop', 'perennial'),]
+gDF$Cover_Type <- factor(gDF$Cover_Type, levels = c('None', 'cover crop', 'perennial'))
+
+stat.test <- compare_means(Overall ~ Cover_Type,
+                           data = gDF,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 110
+groups$Group <- c("None", "cover crop", "perennial")
+
+p5 <- ggplot(gDF, aes(x=factor(Cover_Type), y=Overall)) + 
+  scale_fill_brewer(palette="Dark2", labels = c("Annual Cropland", "Perennial Cropland", "Rangeland")) +
+  geom_boxplot(fill='grey') + 
+  geom_jitter(aes(fill=factor(Current_Land_Use)), shape=21, size=3, width=0.2, height=0, alpha=0.5) +  
+  labs(y='CASH Rating', x='', fill='Land Use') + 
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  scale_x_discrete(labels = c("cover crop" = "Cover Crop", "perennial" = "Perennial")) +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0, 125)
+p5
+
+stat.test <- compare_means(SH_rating ~ Cover_Type,
+                           data = gDF,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 110
+groups$Group <- c("None", "cover crop", "perennial")
+
+p6 <- ggplot(gDF, aes(x=factor(Cover_Type), y=SH_rating)) + 
+  scale_fill_brewer(palette="Dark2", labels = c("Annual Cropland", "Perennial Cropland", "Rangeland")) +
+  geom_boxplot(fill='grey') + 
+  geom_jitter(aes(fill=factor(Current_Land_Use)), shape=21, size=3, width=0.2, height=0, alpha=0.5) +  
+  labs(y='SEMWISE Rating', x='', fill='Land Use') + 
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  scale_x_discrete(labels = c("cover crop" = "Cover Crop", "perennial" = "Perennial")) +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0, 125)
+p6
+
+p_CASH_SH <- ggarrange(p5, p6, nrow = 1, ncol = 2, common.legend = TRUE,
+               labels = c("A","B"))
+p_CASH_SH
+
+#ggsave("Figure5.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+```
+
+### Figure 6 - SEMWISE ratings by cover crop in California site
+```{r}
+data.CA <- read_excel('C:/Users/Heather.Deel/USDA/Manter, Daniel - REE-ARS - NRCS.SHAI/Heather/CA_only.xlsx', sheet='Sheet1', range='A1:DO45')
+
+# select wanted treatments
+data.CA <- data.CA[data.CA$Trt2 %in% c('cc.org.ct', 'cc.syn.ct', 'nc.syn.ct'),]
+
+junk <- data.CA %>%
+  group_by(Trt2) %>%
+  mutate(median = median(SH_rating, na.rm=T))
+
+# graph CA data across cover types (there is only conventional tillage)
+gDF <- data.CA[data.CA$Cover_Type %in% c('None', 'cover crop', 'perennial'),]
+gDF$Cover_Type <- factor(gDF$Cover_Type, levels = c('None', 'cover crop', 'perennial'))
+
+stat.test <- compare_means(SH_rating ~ Trt2,
+                           data = gDF,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 110
+
+# graphing just by cover type
+gDF$Trt2 <- factor(gDF$Trt2, levels=c('cc.org.ct', 'cc.syn.ct', 'nc.syn.ct'))
+p1 <- ggplot(gDF, aes(x=Trt2, y=SH_rating)) + 
+  scale_fill_brewer(palette="Dark2") +
+  geom_boxplot(fill='grey') + 
+  geom_jitter(shape=21, size=3, width=0.2, height=0, alpha=0.5) +  
+  labs(y='SEMWISE Rating', x='', fill='Land Use') +
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  scale_x_discrete(labels = c("None" = "None", "cover crop" = "Cover Crop")) +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0, 115)
+p1
+
+#ggsave("Figure6.tiff", unit = "in", width = 4, height = 4, dpi = 300, device = "tiff")
+```
+
+### Figure 7 - SEMWISE ratings vs root, rich, and dist bins
+```{r}
+# make management bins
+test <- test %>%
+    filter(Remove.SHMI == "No") %>%
+    mutate(root_bin = case_when(root <= 50 ~ 1,              #41
+                                root > 50 & root <= 67 ~ 2,  #142
+                                root > 67 & root < 100 ~ 3,  #133
+                                root == 100 ~ 4)) %>%        #236
+    mutate(rich_bin = case_when(rich < 1 ~ 1,                #116
+                                rich == 1 ~ 2,               #190
+                                rich > 1 & rich < 3 ~ 3,     #114
+                                rich >= 3 ~ 4)) %>%          #187
+    mutate(root_bin = as.numeric(root_bin)) %>%
+    mutate(rich_bin = as.numeric(rich_bin)) %>%
+    mutate(dist_bin = as.numeric(dist)) %>%
+    mutate(SHMI = root_bin + rich_bin + dist_bin) %>%
+    mutate(SHMI_bin = case_when(SHMI <= 4 ~ 1,
+                                SHMI > 4 & SHMI <= 6 ~ 2,
+                                SHMI > 6 & SHMI <= 8 ~ 3,
+                                SHMI > 8 & SHMI <= 10 ~ 4,
+                                SHMI > 10 ~ 5))
+
+# make new test df with SHMI NAs filtered out 
+test.SHMI <- test %>%
+  filter(SHMI != "NA")
+
+### SEMWISE Rating
+# roots
+stat.test <- compare_means(SH_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p1 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = SH_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  geom_boxplot(alpha = 0) +
+  theme_bw() +
+  labs(x = "Root Bin", y = "Soil Health Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p1
+
+
+# richness
+stat.test <- compare_means(SH_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p2 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = SH_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  geom_boxplot(alpha = 0) +
+  theme_bw() +
+  labs(x = "Richness Bin", y = "Soil Health Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p2
+
+# disturbance
+stat.test <- compare_means(SH_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p3 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = SH_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  geom_boxplot(alpha = 0) +
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "Soil Health Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p3
+
+p_SEM_mgt <- ggarrange(p1, p2, p3, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("Figure7.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+```
+
+### Figure 8 - compare SEMWISE rating to SHMI bins
+```{r}
+# SEMWISE vs SHMI
+stat.test <- compare_means(SH_rating ~ SHMI_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+mod <- lm(SH_rating ~ root_bin + rich_bin + dist_bin, data=test.SHMI)
+anova(mod)
+
+p4 <- ggplot(test.SHMI, aes(x = as.character(SHMI_bin), y = SH_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "SHMI Bin", y = "SEMWISE Rating") +
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p4
+
+#ggsave("Figure8.tiff", unit = "in", width = 6, height = 3, dpi = 300, device = "tiff")
+
+mod <- lm(SH_rating ~ SHMI_bin, data=test.SHMI)
+anova(mod)
+
+x <- test.SHMI[,c('SH_rating')]
+y <- test.SHMI[,c('root_bin', 'rich_bin', 'dist_bin')]
+all <- cbind(x,y)
+cor(x,y)
+#cor.mtest(all)
+
+```
+
+### SEM of management indices, compare to SEMWISE
+```{r}
+# create binaries for climate data, center and scale soil health indicators
+data.scale.SHMI <- test.SHMI %>%
+  mutate(root_bin = (scale(root_bin))) %>%
+  mutate(rich_bin = (scale(rich_bin))) %>% 
+  mutate(dist_bin = (scale(dist_bin)))
+
+# test for latent variables
+cash <- data.scale.SHMI[,c('root_bin', 'rich_bin', 'dist_bin')]
+performance::check_factorstructure(cash)
+# moderate evidence that the data are appropriate for factor analysis (KMO=0.67)
+
+# check for multiple factors
+psych::scree(cash, pc=FALSE)
+psych::fa.parallel(cash, fa="fa")
+fit <- factanal(cash, 1, rotation="promax")
+print(fit, digits=2, cutoff=0.3, sort=TRUE)
+
+# define SHMI as a latent variable
+m1 = '
+  # latent variables
+    SHMI2 =~ root_bin + rich_bin + dist_bin
+'
+fit1 <- sem(m1, data=data.scale.SHMI, estimator='MLR', meanstructure=T) 
+summary(fit1, rsquare=T, standardized=T, fit.measures=T, estimates=T) 
+# maybe not enough info to get all of the statistics
+
+# look for potential modifications
+modificationindices(fit1, sort=TRUE) 
+# no modifications to add
+
+# check for Inter Class Correlations
+mod <- lmerTest::lmer(root_bin ~ 1 + (1|Cluster), data=data.scale.SHMI)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(rich_bin ~ 1 + (1|Cluster), data=data.scale.SHMI)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+mod <- lmerTest::lmer(dist_bin ~ 1 + (1|Cluster), data=data.scale.SHMI)
+summary(mod)
+s2u1 <- as.numeric(VarCorr(mod))
+s2e1 <- sigma(mod)^2
+s2u1/(s2u1+s2e1) #icc
+
+# adding clusters to the above model
+m2 = '
+  # latent variables
+    SHMI2 =~ root_bin + rich_bin + dist_bin
+'
+fit2 <- sem(m2, data=data.scale.SHMI, estimator='MLR', meanstructure=T, cluster='Cluster') 
+summary(fit2, rsquare=T, standardized=T, fit.measures=T, estimates=T) 
+
+# get final SHMI latent variable
+data.pred.SHMI <- data.scale.SHMI
+data.pred.SHMI$SHMI2 <- lavPredict(fit2, newdata=data.pred.SHMI, type='lv')
+
+# get cumulative distribution function
+eq <- ecdf(data.pred.SHMI$SHMI2)
+data.pred.SHMI$SHMI2_rating <- eq(data.pred.SHMI$SHMI2)*100
+
+data.pred.SHMI <- data.pred.SHMI %>%
+  mutate(SHMI2_bin = case_when(SHMI2_rating <= 20 ~ 1,
+                            SHMI2_rating > 20 & SHMI2_rating <= 40 ~ 2,
+                            SHMI2_rating > 40 & SHMI2_rating <= 60 ~ 3,
+                            SHMI2_rating > 60 & SHMI2_rating <= 80 ~ 4,
+                            SHMI2_rating > 80 ~ 5,
+                            )) %>%
+  mutate(SHMI2_bin = factor(SHMI2_bin))
+
+levels(data.pred.SHMI$SHMI2_bin) = c('very low', 'low', 'medium', 'high', 'very high')
+
+# regression between SEMWISE and SHMI
+mod <- lm(SH_rating ~ SHMI2_rating, data=data.pred.SHMI)
+summary(mod)
+
+# p1 <- ggplot(data.pred.SHMI, aes(x = as.factor(SHMI2_bin), y = SH_rating)) +
+#   geom_violin() +
+#   theme_bw() +
+#   labs(x = "SHMI Bin", y = "SEMWISE Rating")
+# p1
+# 
+# ggsave("Figure9.tiff", unit = "in", width = 6, height = 3, dpi = 300, device = "tiff")
+```
+
+### Figure S1 - Compare adjusted indicators to SEMWISE soil health latent variable
+```{r}
+# regressions between adjusted indicator values and soil health
+# example for adding slope and intercept in title if needed
+                     # "Intercept =",signif(SOM_SH$coef[[1]],2 ),
+                     # " Slope =",signif(SOM_SH$coef[[2]], 2),
+
+# SOM
+SOM_SH <- lm(SH_rating ~ SOM.corr, data = test)
+summary(SOM_SH)
+p1 <- ggplot(SOM_SH$model, aes(x = SH_rating, y = SOM.corr)) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 =",signif(summary(SOM_SH)$adj.r.squared, 2),
+                     " P =",signif(summary(SOM_SH)$coef[2,4], 2)),
+                     x = "", y = "Adjusted SOM") +
+  theme(plot.title = element_text(size = 10))
+p1
+
+# activeC
+activeC_SH <- lm(SH_rating ~ activeC.corr, data = test)
+summary(activeC_SH)
+p2 <- ggplot(activeC_SH$model, aes(x = SH_rating, y = activeC.corr)) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 =",signif(summary(activeC_SH)$adj.r.squared, 2),
+                     " P =",signif(summary(activeC_SH)$coef[2,4], 2)),
+                     x = "", y = "Adjusted Active C") +
+  theme(plot.title = element_text(size = 10))
+p2
+
+# resp
+resp_SH <- lm(SH_rating ~ resp.corr, data = test)
+summary(resp_SH)
+p3 <- ggplot(resp_SH$model, aes(x = SH_rating, y = resp.corr)) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 =",signif(summary(resp_SH)$adj.r.squared, 2),
+                     " P =",signif(summary(resp_SH)$coef[2,4], 2)),
+                     x = "", y = "Adjusted Respiration") +
+  theme(plot.title = element_text(size = 10))
+p3
+
+# qPCR
+qPCR_SH <- lm(SH_rating ~ qPCR.corr, data = test)
+summary(qPCR_SH)
+p4 <- ggplot(qPCR_SH$model, aes(x = SH_rating, y = qPCR.corr)) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 =",signif(summary(qPCR_SH)$adj.r.squared, 2),
+                     " P =",signif(summary(qPCR_SH)$coef[2,4], 2)),
+                     x = "", y = "Adjusted qPCR") +
+  theme(plot.title = element_text(size = 10))
+p4
+
+# agg_stab
+agg_stab_SH <- lm(SH_rating ~ agg_stab.corr, data = test)
+summary(agg_stab_SH)
+p5 <- ggplot(agg_stab_SH$model, aes(x = SH_rating, y = agg_stab.corr)) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 =",signif(summary(agg_stab_SH)$adj.r.squared, 2),
+                     " P =",signif(summary(agg_stab_SH)$coef[2,4], 2)),
+                     x = "", y = "Adjusted Aggregate Stability") +
+  theme(plot.title = element_text(size = 10))
+p5
+
+# ace
+ace_SH <- lm(SH_rating ~ ace.corr, data = test)
+summary(ace_SH)
+p6 <- ggplot(ace_SH$model, aes(x = SH_rating, y = ace.corr)) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 =",signif(summary(ace_SH)$adj.r.squared, 2),
+                     " P =",signif(summary(ace_SH)$coef[2,4], 2)),
+                     x = "", y = "Adjusted ACE") +
+  theme(plot.title = element_text(size = 10))
+p6
+
+# water_cap
+water_cap_SH <- lm(SH_rating ~ water_cap.corr, data = test)
+summary(water_cap_SH)
+p7 <- ggplot(water_cap_SH$model, aes(x = SH_rating, y = water_cap.corr)) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 =",signif(summary(water_cap_SH)$adj.r.squared, 2),
+                     " P =",signif(summary(water_cap_SH)$coef[2,4], 2)),
+                     x = "", y = "Adjusted Water Capacity") +
+  theme(plot.title = element_text(size = 10))
+p7
+
+
+# merge scatter plots, order from best to worst
+require(grid)
+
+p_scat <- ggarrange(p1, p2, p6, p3, p4, p5, p7, ncol = 4, nrow = 2,
+               labels = c("A","B","C","D","E","F","G"))
+p_scat <- annotate_figure(p_scat, bottom = text_grob("SEMWISE Rating"))
+p_scat
+
+#ggsave("FigureS1.tiff", unit = "in", width = 12, height = 6, dpi = 300, device = "tiff")
+
+```
+
+### Figure S2 - CASH and SEMWISE SOM ratings by texture class
+```{r}
+# direct comparisons of CASH and new ratings using SOM
+test <- test %>%
+  mutate(texture_group = case_when(texture_class %in% c('sand', 'loamy sand', 'sandy loam') ~ 'coarse',
+                                   texture_class %in% c('sandy clay loam', 'loam', 'silt loam', 'silt') ~ 'medium',
+                                   texture_class %in% c('sandy clay', 'clay loam', 'silty clay loam', 'silty clay', 'clay') ~ 'fine'))
+
+# create the SOM rating
+# create SOM rating function
+SOM.eq <- ecdf(test$SOM.resid)
+test$SOM_rating <- SOM.eq(test$SOM.resid)*100
+
+p1 <- ggplot(test, aes(x=SOM.bt, y=organic_matter_rating)) +
+  scale_fill_brewer(palette="Dark2", breaks = c('coarse', 'medium', 'fine'), labels = c('Coarse', 'Medium', 'Fine')) +
+  geom_point(aes(fill=factor(texture_group)), shape=21, size=3, width=0.2, height=0, alpha=0.9) +
+  labs(y='CASH SOM Rating', x='SOM', fill='Texture') +
+  theme_bw() + theme(legend.position = "none", axis.text.x=element_text(angle=45, hjust=1))
+
+p2 <- ggplot(test, aes(x=SOM.bt, y=SOM_rating)) +
+  scale_fill_brewer(palette="Dark2", breaks = c('coarse', 'medium', 'fine'), labels = c('Coarse', 'Medium', 'Fine')) +
+  geom_point(aes(fill=factor(texture_group)), shape=21, size=3, width=0.2, height=0, alpha=0.9) +
+  labs(y='SEMWISE SOM Rating', x='SOM', fill='Texture') +
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1)) + 
+  scale_x_continuous(limits=c(0,8))
+
+p3 <- ggplot(test, aes(x=organic_matter_rating, y=SOM_rating)) +
+  scale_fill_brewer(palette="Dark2", breaks = c('coarse', 'medium', 'fine'), labels = c('Coarse', 'Medium', 'Fine')) +
+  geom_point(aes(fill=factor(texture_group)), shape=21, size=3, width=0.2, height=0, alpha=0.9) +
+  labs(y='SEMWISE SOM Rating', x='CASH SOM Rating', fill='Texture') +
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+p_CASH_sh2 <- ggarrange(p1, p2, p3, nrow = 1, common.legend = TRUE,
+               labels = c("A","B","C"))
+p_CASH_sh2
+
+#ggsave("FigureS2.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+```
+
+### Figures S3-S9 - Indicator ratings vs root, rich, and dist bins
+```{r}
+### SOM Rating
+SOM.eq <- ecdf(test.SHMI$SOM.resid)
+test.SHMI$SOM_rating <- SOM.eq(test.SHMI$SOM.resid)*100
+
+# roots
+stat.test <- compare_means(SOM_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p4 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = SOM_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Root Bin", y = "SOM Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p4
+
+
+# richness
+stat.test <- compare_means(SOM_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p5 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = SOM_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Richness Bin", y = "SOM Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p5
+
+# disturbance
+stat.test <- compare_means(SOM_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p6 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = SOM_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "SOM Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p6
+
+### activeC Rating
+activeC.eq <- ecdf(test.SHMI$activeC.resid)
+test.SHMI$activeC_rating <- activeC.eq(test.SHMI$activeC.resid)*100
+
+# roots
+stat.test <- compare_means(activeC_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p7 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = activeC_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Root Bin", y = "Active C Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p7
+
+
+# richness
+stat.test <- compare_means(activeC_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p8 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = activeC_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Richness Bin", y = "Active C Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p8
+
+# disturbance
+stat.test <- compare_means(activeC_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p9 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = activeC_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "Active C Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p9
+
+### Agg Stab Rating
+agg_stab.eq <- ecdf(test.SHMI$agg_stab.resid)
+test.SHMI$agg_stab_rating <- agg_stab.eq(test.SHMI$agg_stab.resid)*100
+
+# roots
+stat.test <- compare_means(agg_stab_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p10 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = agg_stab_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Root Bin", y = "Agg Stab Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p10
+
+
+# richness
+stat.test <- compare_means(agg_stab_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p11 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = agg_stab_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Richness Bin", y = "Agg Stab Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p11
+
+# disturbance
+stat.test <- compare_means(agg_stab_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p12 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = agg_stab_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "Agg Stab Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p12
+
+### Water Capacity Rating
+water_cap.eq <- ecdf(test.SHMI$water_cap.resid)
+test.SHMI$water_cap_rating <- water_cap.eq(test.SHMI$water_cap.resid)*100
+
+# roots
+stat.test <- compare_means(water_cap_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p13 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = water_cap_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Root Bin", y = "Water Capacity Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p13
+
+
+# richness
+stat.test <- compare_means(water_cap_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p14 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = water_cap_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Richness Bin", y = "Water Capacity Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p14
+
+# disturbance
+stat.test <- compare_means(water_cap_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p15 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = water_cap_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "Water Capacity Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p15
+
+### Resp Rating
+resp.eq <- ecdf(test.SHMI$resp.resid)
+test.SHMI$resp_rating <- resp.eq(test.SHMI$resp.resid)*100
+
+# roots
+stat.test <- compare_means(resp_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p16 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = resp_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Root Bin", y = "Respiration Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p16
+
+
+# richness
+stat.test <- compare_means(resp_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p17 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = resp_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Richness Bin", y = "Respiration Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p17
+
+# disturbance
+stat.test <- compare_means(resp_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p18 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = resp_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "Respiration Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p18
+
+### ACE Rating
+ace.eq <- ecdf(test.SHMI$ace.resid)
+test.SHMI$ace_rating <- ace.eq(test.SHMI$ace.resid)*100
+
+# roots
+stat.test <- compare_means(ace_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p19 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = ace_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Root Bin", y = "ACE Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p19
+
+
+# richness
+stat.test <- compare_means(ace_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p20 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = ace_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Richness Bin", y = "ACE Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p20
+
+# disturbance
+stat.test <- compare_means(ace_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p21 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = ace_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "ACE Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p21
+
+### qPCR Rating
+qPCR.eq <- ecdf(test.SHMI$qPCR.resid)
+test.SHMI$qPCR_rating <- qPCR.eq(test.SHMI$qPCR.resid)*100
+
+# roots
+stat.test <- compare_means(qPCR_rating ~ root_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p22 <- ggplot(test.SHMI, aes(x = as.character(root_bin), y = qPCR_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Root Bin", y = "qPCR Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p22
+
+
+# richness
+stat.test <- compare_means(qPCR_rating ~ rich_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p23 <- ggplot(test.SHMI, aes(x = as.character(rich_bin), y = qPCR_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Richness Bin", y = "qPCR Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p23
+
+# disturbance
+stat.test <- compare_means(qPCR_rating ~ dist_bin,
+                           data = test.SHMI,
+                           method = "wilcox.test",
+                           p.adj='fdr')
+stat.test$Comparison <- paste0(stat.test$group1, " - ", stat.test$group2)
+groups <- rcompanion::cldList(p.adj ~ Comparison,
+                              data = stat.test,
+                              threshold = 0.05)
+groups$y <- 106
+
+p24 <- ggplot(test.SHMI, aes(x = as.character(dist_bin), y = qPCR_rating)) +
+  scale_fill_brewer(palette="Dark2", name = "Land Use", labels = c("Annual Cropland","Perennial Cropland","Rangeland")) +
+  geom_boxplot() +
+  geom_jitter(aes(fill=Current_Land_Use), shape=21, size=3, width=0.2, height=0, alpha=0.5) + 
+  theme_bw() +
+  labs(x = "Disturbance Bin", y = "qPCR Rating") + 
+  geom_text(inherit.aes=F, data=groups, aes(x=Group, y=y, label=Letter)) +
+  ylim(0,107)
+p24
+
+
+p_SEM_mgt <- ggarrange(p4, p5, p6, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("FigureS3.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+p_SEM_mgt <- ggarrange(p7, p8, p9, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("FigureS4.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+p_SEM_mgt <- ggarrange(p10, p11, p12, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("FigureS5.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+p_SEM_mgt <- ggarrange(p13, p14, p15, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("FigureS6.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+p_SEM_mgt <- ggarrange(p16, p17, p18, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("FigureS7.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+p_SEM_mgt <- ggarrange(p19, p20, p21, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("FigureS8.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+p_SEM_mgt <- ggarrange(p22, p23, p24, 
+                       ncol = 3, nrow = 1,
+                       common.legend = TRUE)
+p_SEM_mgt
+#ggsave("FigureS9.tiff", unit = "in", width = 8, height = 4, dpi = 300, device = "tiff")
+
+```
+
+# save the metadata as an R object for use in the next paper
+```{r}
+data.pred.SHMI %>% 
+  count('Site')
+
+#saveRDS(data.pred.SHMI, 'data.pred.SHMI.RDS')
+```
+
+
+
